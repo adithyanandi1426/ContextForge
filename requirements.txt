@@ -2,3 +2,5 @@ gitingest>=0.3,<0.4
 streamlit>=1.40,<2
 tiktoken>=0.7,<1
 plotly>=5.20,<7
+tree-sitter>=0.25.2,<0.26
+tree-sitter-language-pack>=0.9,<1

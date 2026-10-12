@@ -25,6 +25,12 @@ to know which files, symbols, and tests to include. ContextForge provides:
   file/class/method to likely dependencies and impacted callers.
 - A tokenizer-based input-token comparison between the full repository and
   task-ranked context.
+- A modular analysis core that builds evidence-bearing Java AST relationships
+  and reads direct Maven dependencies.
+- A dependency-upgrade review that lists likely source consumers and shows
+  their class/method neighborhoods as an interactive graph.
+- A Java-aware context compiler that selects related source files within an
+  actual tokenizer budget.
 
 The app does not call an LLM or execute code from the indexed repository.
 
@@ -86,6 +92,32 @@ code, overloaded or duplicate symbol names, and language-specific import
 resolution may be missed or ambiguous. Use the graph to navigate review, then
 verify findings against the source and tests.
 
+## Modular Java analysis (early access)
+
+Indexing also builds a typed graph in `contextforge/`. Java declarations,
+nested types, methods, imports, object creation, inheritance, and method
+invocations are extracted from the Java AST. Relationship records include
+source locations and evidence/confidence details. A unique-name match is still
+reported as a syntactic reference, not as compiler-verified call resolution.
+
+The **Dependency upgrades** tab reads direct Maven dependencies from `pom.xml`,
+including simple version-property references. Choose a coordinate and enter
+the proposed version to review matching Java import consumers and see their
+class/method neighborhood. Consumer matching uses an inferred package-prefix
+heuristic based on the Maven group; it identifies files to review and does not
+claim that an upgrade is compatible or incompatible. Transitive dependencies,
+Gradle dependency declarations, dependency-management inheritance, complete
+property interpolation, and semantic Java type resolution are not implemented
+yet. The impact report can be downloaded as JSON with supporting import
+evidence.
+
+In **Context builder**, expand **AST-ranked context compiler (Java-aware)** to
+build a second context package. It ranks source files using task terms and
+indexed Java relationships, includes complete files within the selected
+`cl100k_base` token budget, and explains why each selected file was included.
+This experimental compiler complements rather than replaces the existing
+multi-language heuristic context builder.
+
 To create a full Gitingest digest, use **Create Gitingest digest** in the
 sidebar. This works with local paths and GitHub repository URLs; GitHub
 subdirectory URLs require Git to be installed. The result includes a summary
@@ -120,6 +152,16 @@ The directory tree shows repository files and folders, including files that
 are not analyzed as source. Generated or dependency directories such as
 `.git`, `node_modules`, `target`, `build`, and virtual environments are omitted
 from both the tree and the source-file scan.
+
+The modular core currently extracts structural relationships from Java only.
+Other supported source files are retained as file nodes and can still be used
+by the existing inventory, heuristic impact graph, and context builder.
+
+Run the focused core tests with:
+
+```powershell
+python -m unittest discover -s tests
+```
 
 GitHub repositories are cloned shallowly when Git is available. If Git cannot
 be found, ContextForge downloads public repository ZIP archives instead.

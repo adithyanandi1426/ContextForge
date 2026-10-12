@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -18,6 +19,11 @@ from impact_graph import (
     extract_definitions,
     find_impact_targets,
 )
+from contextforge.context_compiler import compile_context
+from contextforge.graph_view import build_graph_figure
+from contextforge.indexer import RepositoryIndexer
+from contextforge.models import EdgeType, NodeType
+from contextforge.upgrade import analyze_dependency_upgrade
 import streamlit as st
 import tiktoken
 
@@ -476,14 +482,18 @@ if analyze:
             directory_index = build_directory_index(root)
             paths = discover_files(root)
             files = [analyze_file(root, p) for p in paths]
+            core_graph = RepositoryIndexer().index(root)
 
             if not files:
                 raise ValueError("No supported source files were found.")
 
             st.session_state["files"] = files
             st.session_state["directory_index"] = directory_index
+            st.session_state["core_graph"] = core_graph
             st.session_state.pop("directory_browser_folder", None)
             st.session_state.pop("impact_graph", None)
+            st.session_state.pop("upgrade_impacts", None)
+            st.session_state.pop("ast_context_package", None)
             st.session_state["root_label"] = source
             st.session_state["index_summary"] = {
                 "files": len(files),
@@ -492,6 +502,8 @@ if analyze:
                 "extensions": Counter(
                     Path(f["path"]).suffix or "(no extension)" for f in files
                 ),
+                "core_nodes": len(core_graph.nodes),
+                "core_relationships": len(core_graph.edges),
             }
             st.session_state["indexed"] = True
 
@@ -549,18 +561,21 @@ if st.session_state.get("indexed"):
     files = st.session_state["files"]
     summary = st.session_state["index_summary"]
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Files indexed", summary["files"])
     c2.metric("Symbols detected", summary["symbols"])
     c3.metric("Source lines", f"{summary['lines']:,}")
     c4.metric("Extensions", len(summary["extensions"]))
+    c5.metric("AST graph nodes", summary["core_nodes"])
+    c6.metric("Evidence edges", summary["core_relationships"])
 
-    directory_tab, inventory_tab, context_tab, impact_tab = st.tabs(
+    directory_tab, inventory_tab, context_tab, impact_tab, upgrade_tab = st.tabs(
         [
             "Directory structure",
             "Repository inventory",
             "Context builder",
             "Impact graph",
+            "Dependency upgrades",
         ]
     )
 
@@ -729,6 +744,154 @@ if st.session_state.get("indexed"):
                             "detected for this target."
                         )
 
+    with upgrade_tab:
+        st.subheader("Dependency upgrade impact")
+        st.caption(
+            "Review indexed Maven dependency consumers and their Java "
+            "classes/methods. Source compatibility is not inferred."
+        )
+        core_graph = st.session_state["core_graph"]
+        if core_graph.limitations:
+            with st.expander(
+                f"Analysis limitations ({len(core_graph.limitations)})"
+            ):
+                for limitation in core_graph.limitations:
+                    st.write(f"- {limitation}")
+        coordinates = sorted({
+            dependency.coordinate
+            for dependency in core_graph.dependencies
+        })
+        if not coordinates:
+            st.info(
+                "No direct Maven dependencies were indexed. This analysis "
+                "currently reads dependencies declared in pom.xml files."
+            )
+        else:
+            coordinate = st.selectbox(
+                "Maven dependency",
+                coordinates,
+                key="upgrade_coordinate",
+            )
+            group, artifact = coordinate.split(":", 1)
+            current_versions = sorted({
+                dependency.version or "(version not declared)"
+                for dependency in core_graph.dependencies
+                if dependency.group == group and dependency.artifact == artifact
+            })
+            st.caption("Declared version(s): " + ", ".join(current_versions))
+            target_version = st.text_input(
+                "Target version to review",
+                key="upgrade_target_version",
+                placeholder="For example: 5.3.1",
+            )
+            if st.button("Analyze upgrade impact", type="primary"):
+                if not target_version.strip():
+                    st.warning("Enter the target version to review.")
+                else:
+                    st.session_state["upgrade_impacts"] = {
+                        "coordinate": coordinate,
+                        "target_version": target_version.strip(),
+                        "results": analyze_dependency_upgrade(
+                            core_graph,
+                            group,
+                            artifact,
+                            target_version.strip(),
+                        ),
+                    }
+            upgrade_result = st.session_state.get("upgrade_impacts")
+            if (
+                upgrade_result
+                and upgrade_result["coordinate"] == coordinate
+                and upgrade_result["target_version"] == target_version.strip()
+            ):
+                impacts = upgrade_result["results"]
+                if not impacts:
+                    st.info(
+                        "No imports could be linked to this dependency using "
+                        "the current Maven group/package heuristic."
+                    )
+                else:
+                    impact = impacts[0]
+                    metric_a, metric_b = st.columns(2)
+                    metric_a.metric("Potential consumer files", len(impact.files))
+                    metric_b.metric("Impacted modules", len(impact.modules))
+                    st.warning(impact.caveat)
+                    st.dataframe(
+                        [{
+                            "File": node.path,
+                            "Symbol": node.name,
+                            "Version declared": impact.dependency.version or "unspecified",
+                            "Review target": impact.target_version,
+                            "Evidence": "Package-prefix import match (inferred)",
+                        } for node in impact.files],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    dependency_node_ids = {
+                        node.id for node in core_graph.nodes.values()
+                        if node.type == NodeType.DEPENDENCY
+                        and node.name == coordinate
+                    }
+                    evidence_by_file = {}
+                    for node in impact.files:
+                        matching_edges = [
+                            edge for edge in core_graph.edges
+                            if edge.source == f"file:{node.path}"
+                            and edge.target in dependency_node_ids
+                            and edge.type == EdgeType.REFERENCES
+                        ]
+                        evidence_by_file[node.path or ""] = [
+                            {
+                                "line": edge.evidence.line,
+                                "method": edge.evidence.method,
+                                "confidence": edge.evidence.confidence,
+                                "detail": edge.evidence.detail,
+                            }
+                            for edge in matching_edges
+                        ]
+                    report = {
+                        "dependency": coordinate,
+                        "declared_version": impact.dependency.version,
+                        "target_version": impact.target_version,
+                        "confidence": impact.confidence,
+                        "caveat": impact.caveat,
+                        "modules": [
+                            {"name": node.name, "path": node.path}
+                            for node in impact.modules
+                        ],
+                        "consumers": [
+                            {
+                                "path": node.path,
+                                "symbol": node.name,
+                                "evidence": evidence_by_file.get(node.path or "", []),
+                            }
+                            for node in impact.files
+                        ],
+                    }
+                    st.download_button(
+                        "Download upgrade impact report",
+                        data=json.dumps(report, indent=2),
+                        file_name="dependency-upgrade-impact.json",
+                        mime="application/json",
+                    )
+                    roots = dependency_node_ids | {
+                        f"file:{node.path}" for node in impact.files if node.path
+                    }
+                    st.plotly_chart(
+                        build_graph_figure(
+                            core_graph,
+                            roots,
+                            max_depth=3,
+                        ),
+                        use_container_width=True,
+                        config={"scrollZoom": True, "displaylogo": False},
+                    )
+                    st.caption(
+                        "Hover over nodes for file path and line. Edge labels "
+                        "show relationship kinds; unresolved Java references "
+                        "remain explicitly marked as such."
+                    )
+
     with context_tab:
         st.subheader("Compile context for a development task")
         task = st.text_area(
@@ -856,5 +1019,48 @@ if st.session_state.get("indexed"):
                 mime="text/markdown",
                 type="primary",
             )
+
+        with st.expander("AST-ranked context compiler (Java-aware)"):
+            st.caption(
+                "Ranks files using task terms and indexed Java relationships, "
+                "then includes whole files up to the selected token budget."
+            )
+            if st.button("Build AST-ranked context"):
+                compiled = compile_context(
+                    st.session_state["core_graph"],
+                    task,
+                    token_budget=budget,
+                    count_tokens=count_tokens,
+                )
+                st.session_state["ast_context_package"] = {
+                    "task": task,
+                    "budget": budget,
+                    "compiled": compiled,
+                    "tokens": count_tokens(compiled.text),
+                }
+            ast_package = st.session_state.get("ast_context_package")
+            if (
+                ast_package
+                and ast_package["task"] == task
+                and ast_package["budget"] == budget
+            ):
+                compiled = ast_package["compiled"]
+                st.metric("AST-ranked package tokens", f"{ast_package['tokens']:,}")
+                st.dataframe(
+                    [{
+                        "File": path,
+                        "Why included": compiled.reason_by_file[path],
+                    } for path in compiled.files],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.code(compiled.text, language="markdown")
+                st.download_button(
+                    "Download AST-ranked context",
+                    data=compiled.text,
+                    file_name="contextforge-ast-context.md",
+                    mime="text/markdown",
+                    key="download_ast_context",
+                )
 else:
     st.info("Index a repository to begin.")
